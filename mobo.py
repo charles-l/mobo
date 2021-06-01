@@ -5,9 +5,12 @@ import functools
 from OpenGL import GL
 import sqlite_utils
 import requests
+import twitter_session
 from PIL import Image
 
 db = sqlite_utils.Database(':memory:')
+
+tsession = twitter_session.TwitterSession()
 
 db.create_table(
     'images', {'id': int, 'image': str, 'x': int, 'y': int, 'w': int, 'h': int},
@@ -44,11 +47,17 @@ def skia_surface(window):
 
 @functools.lru_cache
 def load_img(path):
-    if path.startswith('http://') or path.startswith('https://'):
+    if path.startswith('https://twitter.com'):
+        components = path.removeprefix('https://twitter.com/').split('/')
+        assert components[1] == 'status'
+        tweet_id = components[2]
+        return load_img(tsession.get_tweet(tweet_id)['extended_entities']['media'][0]['media_url'])
+    elif path.startswith('http://') or path.startswith('https://'):
         r = requests.get(path, stream=True)
         r.raw.decode_contents = True
-        img = Image.open(r.raw).convert('RGBA')
+        img = Image.open(r.raw)
         print('downloaded image from ', path)
+        img = img.convert('RGBA')
         return skia.Image.frombytes(img.tobytes(), img.size, skia.kRGBA_8888_ColorType)
     elif path.startswith('/'):
         return skia.Image.open(path)
@@ -65,7 +74,8 @@ paint = skia.Paint(
 
 def render_frame(canvas, selected):
     for r in db['images'].rows:
-        canvas.drawImage(load_img(r['image']), r['x'], r['y'], paint)
+        img = load_img(r['image'])
+        canvas.drawImage(img, r['x'], r['y'], paint)
         if r['id'] in selected:
             canvas.drawRect(skia.Rect(r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h']), paint)
 
