@@ -100,6 +100,21 @@ def pan(window):
             pan = new_pan
         yield pan
 
+
+def drag(window, selected):
+    startx, starty = glfw.get_cursor_pos(window)
+    bindings = ','.join(['?'] * len(selected))
+    update_query = f'update images set x = x + ?, y = y + ? where id in ({bindings})'
+    while True:
+        if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) != glfw.PRESS:
+            endx, endy = glfw.get_cursor_pos(window)
+            diffx, diffy = endx-startx, endy-starty
+            for image_id in selected:
+                db.execute(update_query, (diffx, diffy, *selected))
+                return
+        yield
+
+
 invT = skia.Matrix()
 def select(window):
     selected = set()
@@ -131,14 +146,24 @@ with glfw_window() as window:
     glfw.set_drop_callback(window, drop_callback)
     glfw.set_key_callback(window, key_callback)
 
+    click_drag = None
     while (glfw.get_key(window, glfw.KEY_ESCAPE) != glfw.PRESS
         and not glfw.window_should_close(window)):
         with skia_surface(window) as surface:
             with surface as canvas:
                 canvas.clear(skia.ColorWHITE)
                 x, y = next(panner)
-
                 selected = next(selector)
+
+                if click_drag is not None:
+                    try:
+                        next(click_drag)
+                    except StopIteration:
+                        click_drag = None
+                else:
+                    if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
+                        click_drag = drag(window, selected)
+
                 canvas.translate(WIDTH//2, HEIGHT//2)
                 canvas.scale(zoom, zoom)
                 canvas.translate(-(WIDTH//2), -(HEIGHT//2))

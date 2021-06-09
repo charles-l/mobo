@@ -33,7 +33,6 @@ class TwitterSession:
             f"https://twitter.com/i/api/2/timeline/conversation/{tweet_id}.json?tweet_mode=extended",
             headers=self.headers,
         )
-        print(r)
         return r.json()["globalObjects"]["tweets"][tweet_id]
 
 
