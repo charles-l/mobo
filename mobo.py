@@ -102,16 +102,20 @@ def pan(window):
 
 
 def drag(window, selected):
-    startx, starty = glfw.get_cursor_pos(window)
     bindings = ','.join(['?'] * len(selected))
-    update_query = f'update images set x = x + ?, y = y + ? where id in ({bindings})'
+    start_pos = {r['id']: (r['x'], r['y']) for r in db['images'].rows_where(f'id in ({bindings})', list(selected))}
+    update_query = f'update images set x = ?, y = ? where id in ({bindings})'
+    startx, starty = glfw.get_cursor_pos(window)
     while True:
+        endx, endy = glfw.get_cursor_pos(window)
+        diffx, diffy = endx-startx, endy-starty
+        for image_id in selected:
+            db['images'].update(image_id, {'x': start_pos[image_id][0] + diffx,
+                                           'y': start_pos[image_id][1] + diffy})
+
         if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) != glfw.PRESS:
-            endx, endy = glfw.get_cursor_pos(window)
-            diffx, diffy = endx-startx, endy-starty
-            for image_id in selected:
-                db.execute(update_query, (diffx, diffy, *selected))
-                return
+            return
+
         yield
 
 
@@ -153,7 +157,6 @@ with glfw_window() as window:
             with surface as canvas:
                 canvas.clear(skia.ColorWHITE)
                 x, y = next(panner)
-                selected = next(selector)
 
                 if click_drag is not None:
                     try:
@@ -161,6 +164,7 @@ with glfw_window() as window:
                     except StopIteration:
                         click_drag = None
                 else:
+                    selected = next(selector)
                     if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
                         click_drag = drag(window, selected)
 
