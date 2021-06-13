@@ -6,6 +6,8 @@ from OpenGL import GL
 import sqlite_utils
 import requests
 import twitter_session
+import av
+import numpy as np
 from PIL import Image
 
 db = sqlite_utils.Database(':memory:')
@@ -51,6 +53,7 @@ def load_img(path):
         components = path.removeprefix('https://twitter.com/').split('/')
         assert components[1] == 'status'
         tweet_id = components[2]
+        print(tsession.get_tweet(tweet_id)['extended_entities']['media'])
         return load_img(tsession.get_tweet(tweet_id)['extended_entities']['media'][0]['media_url'])
     elif path.startswith('http://') or path.startswith('https://'):
         r = requests.get(path, stream=True)
@@ -72,7 +75,20 @@ paint = skia.Paint(
     Color=skia.ColorRED,
 )
 
+def video():
+    with open('/home/nc/Downloads/GLdGftoLHQ2MUPn4.mp4', 'rb') as f:
+        with av.open(f) as container:
+            stream = container.streams.video[0]
+            while True:
+                for frame in container.decode(stream):
+                    framedata = frame.reformat(format='rgb32').to_ndarray()
+                    yield skia.Image.fromarray(framedata, colorType=skia.ColorType.kBGRA_8888_ColorType)
+                container.seek(0)
+
+video_frame = video()
+
 def render_frame(canvas, selected):
+    canvas.drawImage(next(video_frame), 0, 0)
     for r in db['images'].rows:
         img = load_img(r['image'])
         canvas.drawImage(img, r['x'], r['y'], paint)
@@ -142,6 +158,7 @@ def key_callback(window, key, scancode, action, mod):
         db['images'].insert({'image': s,
                              'x': -x, 'y': -y, 'w': img.width(), 'h': img.height()})
 
+
 with glfw_window() as window:
     GL.glClear(GL.GL_COLOR_BUFFER_BIT)
     glfw.set_scroll_callback(window, scroll_callback)
@@ -182,4 +199,4 @@ with glfw_window() as window:
             surface.flushAndSubmit()
             glfw.swap_buffers(window)
 
-        glfw.wait_events()
+        glfw.poll_events()
