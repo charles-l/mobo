@@ -7,6 +7,7 @@ import sqlite_utils
 import requests
 import twitter_session
 import av
+import time
 import numpy as np
 from PIL import Image
 
@@ -75,17 +76,26 @@ paint = skia.Paint(
     Color=skia.ColorRED,
 )
 
-def video():
-    with open('/home/nc/Downloads/GLdGftoLHQ2MUPn4.mp4', 'rb') as f:
+def video(path):
+    # HACK: used to increase playback rate slightly because of high python or
+    # glfw latency. If we wait for two frames, we'll be running too slow.
+    # TODO: average framerate over time instead of per frame.
+    drift = 0.015
+    with open(path, 'rb') as f:
         with av.open(f) as container:
             stream = container.streams.video[0]
+            frame_time = 1/stream.average_rate
             while True:
                 for frame in container.decode(stream):
                     framedata = frame.reformat(format='rgb32').to_ndarray()
-                    yield skia.Image.fromarray(framedata, colorType=skia.ColorType.kBGRA_8888_ColorType)
+                    frame_start_time = glfw.get_time()
+                    frame_img = skia.Image.fromarray(framedata, colorType=skia.ColorType.kBGRA_8888_ColorType)
+                    yield frame_img
+                    while glfw.get_time() - frame_start_time < frame_time - drift:
+                        yield frame_img
                 container.seek(0)
 
-video_frame = video()
+video_frame = video('/home/nc/Downloads/GLdGftoLHQ2MUPn4.mp4')
 
 def render_frame(canvas, selected):
     canvas.drawImage(next(video_frame), 0, 0)
@@ -158,7 +168,6 @@ def key_callback(window, key, scancode, action, mod):
         db['images'].insert({'image': s,
                              'x': -x, 'y': -y, 'w': img.width(), 'h': img.height()})
 
-
 with glfw_window() as window:
     GL.glClear(GL.GL_COLOR_BUFFER_BIT)
     glfw.set_scroll_callback(window, scroll_callback)
@@ -198,5 +207,4 @@ with glfw_window() as window:
                 render_frame(canvas, selected)
             surface.flushAndSubmit()
             glfw.swap_buffers(window)
-
         glfw.poll_events()
