@@ -197,7 +197,8 @@ def pan(window):
                 new_pan = (pan[0] + xpos - pan_start[0],
                            pan[1] + ypos - pan_start[1])
                 yield new_pan
-            pan = new_pan
+            # FIXME: panning is borked
+            #pan = new_pan
         yield pan
 
 
@@ -255,46 +256,58 @@ def key_callback(window, key, scancode, action, mod):
                              'h': r.height()})
 
 
-with glfw_window() as window:
-    GL.glClear(GL.GL_COLOR_BUFFER_BIT)
-    glfw.set_scroll_callback(window, scroll_callback)
-    panner = pan(window)
-    selector = select(window)
-    glfw.set_drop_callback(window, drop_callback)
-    glfw.set_key_callback(window, key_callback)
+x, y = 0, 0
+invT = None
 
-    click_drag = None
-    last_frame = glfw.get_time()
-    while (glfw.get_key(window, glfw.KEY_ESCAPE) != glfw.PRESS
-           and not glfw.window_should_close(window)):
+def main():
+    global x, y, invT, zoom
+    with glfw_window() as window:
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        glfw.set_scroll_callback(window, scroll_callback)
+        panner = pan(window)
+        selector = select(window)
+        glfw.set_drop_callback(window, drop_callback)
+        glfw.set_key_callback(window, key_callback)
+
+        click_drag = None
+        last_frame = glfw.get_time()
         with skia_surface(window) as surface:
             with surface as canvas:
-                dt = glfw.get_time() - last_frame
-                last_frame = glfw.get_time()
-                canvas.clear(skia.ColorWHITE)
-                x, y = next(panner)
+                while (glfw.get_key(window, glfw.KEY_ESCAPE) != glfw.PRESS
+                       and not glfw.window_should_close(window)):
+                    dt = glfw.get_time() - last_frame
+                    last_frame = glfw.get_time()
+                    canvas.clear(skia.ColorWHITE)
+                    x, y = next(panner)
 
-                if click_drag is not None:
-                    try:
-                        next(click_drag)
-                    except StopIteration:
-                        click_drag = None
-                else:
-                    selected = next(selector)
-                    if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
-                        click_drag = drag(window, selected)
+                    if click_drag is not None:
+                        try:
+                            next(click_drag)
+                        except StopIteration:
+                            click_drag = None
+                    else:
+                        selected = next(selector)
+                        if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
+                            click_drag = drag(window, selected)
 
-                canvas.translate(WIDTH//2, HEIGHT//2)
-                canvas.scale(zoom, zoom)
-                canvas.translate(-(WIDTH//2), -(HEIGHT//2))
-                canvas.translate(x, y)
+                    canvas.translate(WIDTH//2, HEIGHT//2)
+                    canvas.scale(zoom, zoom)
+                    canvas.translate(-(WIDTH//2), -(HEIGHT//2))
+                    canvas.translate(x, y)
 
-                # FIXME: a gross hack
-                m = skia.Matrix()
-                assert canvas.getTotalMatrix().invert(m)
-                invT = m
+                    # reset transforms
+                    zoom = 1
 
-                render_frame(canvas, selected, dt)
-            surface.flushAndSubmit()
-            glfw.swap_buffers(window)
-        glfw.poll_events()
+                    # FIXME: a gross hack
+                    m = skia.Matrix()
+                    assert canvas.getTotalMatrix().invert(m)
+                    invT = m
+
+                    render_frame(canvas, selected, dt)
+                    surface.flushAndSubmit()
+                    glfw.swap_buffers(window)
+                    glfw.poll_events()
+
+
+if __name__ == '__main__':
+    main()
