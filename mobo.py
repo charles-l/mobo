@@ -93,7 +93,7 @@ class Video:
         self.cur_frame_data = self._get_frame_data(next(self.decode_stream))
         self.framerate = stream.average_rate
 
-    def render_frame(self, dt: float) -> skia.Image:
+    def render_frame(self) -> skia.Image:
         # FIXME: if we have multiple instances of a video, all the videos will
         # play back at an accelerated speed because dt will be added multiple
         # times. Probably smarter to apply update logic separately from
@@ -106,7 +106,7 @@ class Video:
         # directly from libav itself rather than duplicating the tracking here.
 
         assert self.cur_frame_data
-        self.time += dt
+        self.time = glfw.get_time()
         goal_frame = int(self.time * self.framerate) % self.frames
 
         if self.cur_frame == goal_frame:
@@ -139,12 +139,12 @@ class Video:
 renderables = {}
 
 
-def get_renderable(resource_path: str, dt: float):
+def get_renderable(resource_path: str):
     if resource_path in renderables:
         # TODO: create a class for Image so we don't have to conditonally call
         # render_frame
         if isinstance(renderables[resource_path], Video):
-            return renderables[resource_path].render_frame(dt)
+            return renderables[resource_path].render_frame()
         else:
             return renderables[resource_path]
     if resource_path.endswith(('.png', '.jpg', '.jpeg')):
@@ -152,7 +152,7 @@ def get_renderable(resource_path: str, dt: float):
         return renderables[resource_path]
     elif resource_path.endswith(('.mp4',)):
         renderables[resource_path] = Video(resource_path)
-        return renderables[resource_path].render_frame(dt)
+        return renderables[resource_path].render_frame()
     else:
         raise ValueError('Unknown file type for ', resource_path)
 
@@ -165,12 +165,9 @@ paint = skia.Paint(
 )
 
 
-def render_frame(canvas, selected, dt: float):
-    applied_dt = set()
+def render_frame(canvas, selected):
     for r in db['images'].rows:
-        img = get_renderable(r['image'], 0 if r['image'] in applied_dt else dt)
-        # horrible HACK to avoid double iterating a video frame
-        applied_dt.add(r['image'])
+        img = get_renderable(r['image'])
         canvas.drawImage(img, r['x'], r['y'], paint)
         if r['id'] in selected:
             canvas.drawRect(
@@ -240,7 +237,7 @@ def select(window):
 
 
 def drop_callback(window, paths):
-    r = get_renderable(paths[0], 0)
+    r = get_renderable(paths[0])
     x, y = to_global(glfw.get_cursor_pos(window))
     db['images'].insert({'image': paths[0],
                          'x': x,
@@ -253,7 +250,7 @@ def key_callback(window, key, scancode, action, mod):
     # TODO: add image support (using a proper clipboard management library)
     if mod == glfw.MOD_CONTROL and key == glfw.KEY_V and action == glfw.PRESS:
         s = glfw.get_clipboard_string(window).decode('utf-8')
-        r = get_renderable(s, 0)
+        r = get_renderable(s)
         x, y = to_global((WIDTH//2, HEIGHT//2))
         db['images'].insert({'image': s,
                              'x': x,
@@ -275,13 +272,10 @@ def main():
         glfw.set_key_callback(window, key_callback)
 
         click_drag = None
-        last_frame = glfw.get_time()
         with skia_surface(window) as surface:
             with surface as canvas:
                 while (glfw.get_key(window, glfw.KEY_ESCAPE) != glfw.PRESS
                        and not glfw.window_should_close(window)):
-                    dt = glfw.get_time() - last_frame
-                    last_frame = glfw.get_time()
                     canvas.clear(skia.ColorWHITE)
                     dx, dy = next(panner)
 
@@ -309,7 +303,7 @@ def main():
                     assert canvas.getTotalMatrix().invert(m)
                     invT = m
 
-                    render_frame(canvas, selected, dt)
+                    render_frame(canvas, selected)
                     surface.flushAndSubmit()
                     glfw.swap_buffers(window)
                     glfw.poll_events()
