@@ -166,8 +166,11 @@ paint = skia.Paint(
 
 
 def render_frame(canvas, selected, dt: float):
+    applied_dt = set()
     for r in db['images'].rows:
-        img = get_renderable(r['image'], dt)
+        img = get_renderable(r['image'], 0 if r['image'] in applied_dt else dt)
+        # horrible HACK to avoid double iterating a video frame
+        applied_dt.add(r['image'])
         canvas.drawImage(img, r['x'], r['y'], paint)
         if r['id'] in selected:
             canvas.drawRect(
@@ -185,30 +188,32 @@ def scroll_callback(window, xoffset, yoffset):
 
 
 def pan(window):
-    pan = 0, 0
     while True:
         if (glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) ==
                 glfw.PRESS):
-            pan_start = glfw.get_cursor_pos(window)
-            new_pan = 0, 0
+            lastx, lasty = glfw.get_cursor_pos(window)
             while (glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) ==
                     glfw.PRESS):
-                xpos, ypos = glfw.get_cursor_pos(window)
-                new_pan = (pan[0] + xpos - pan_start[0],
-                           pan[1] + ypos - pan_start[1])
-                yield new_pan
-            # FIXME: panning is borked
-            #pan = new_pan
-        yield pan
+                x, y = glfw.get_cursor_pos(window)
+                yield (x - lastx, y - lasty)
+                lastx, lasty = x, y
+        yield (0, 0)
+
+
+def to_global(p):
+    '''Convert an (x, y) tuple to global space.'''
+    x, y = p
+    (gx, gy), = invT.mapPoints([skia.Point(x, y)])
+    return gx, gy
 
 
 def drag(window, selected):
     bindings = ','.join(['?'] * len(selected))
     start_pos = {r['id']: (r['x'], r['y']) for r in db['images'].rows_where(
         f'id in ({bindings})', list(selected))}
-    startx, starty = glfw.get_cursor_pos(window)
+    startx, starty = to_global(glfw.get_cursor_pos(window))
     while True:
-        endx, endy = glfw.get_cursor_pos(window)
+        endx, endy = to_global(glfw.get_cursor_pos(window))
         diffx, diffy = endx-startx, endy-starty
         for image_id in selected:
             db['images'].update(image_id,
@@ -228,18 +233,18 @@ def select(window):
     selected = set()
     while True:
         if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
-            mosx, mosy = glfw.get_cursor_pos(window)
-            (gx, gy), = invT.mapPoints([skia.Point(mosx, mosy)])
+            mosx, mosy = to_global(glfw.get_cursor_pos(window))
             selected = {x['id'] for x in db['images'].rows_where(
-                '? between x and x + w and ? between y and y + h', [gx, gy])}
+                '? between x and x + w and ? between y and y + h', [mosx, mosy])}
         yield selected
 
 
 def drop_callback(window, paths):
     r = get_renderable(paths[0], 0)
+    x, y = to_global(glfw.get_cursor_pos(window))
     db['images'].insert({'image': paths[0],
-                         'x': -x,
-                         'y': -y,
+                         'x': x,
+                         'y': y,
                          'w': r.width(),
                          'h': r.height()})
 
@@ -249,18 +254,18 @@ def key_callback(window, key, scancode, action, mod):
     if mod == glfw.MOD_CONTROL and key == glfw.KEY_V and action == glfw.PRESS:
         s = glfw.get_clipboard_string(window).decode('utf-8')
         r = get_renderable(s, 0)
+        x, y = to_global((WIDTH//2, HEIGHT//2))
         db['images'].insert({'image': s,
-                             'x': -x,
-                             'y': -y,
+                             'x': x,
+                             'y': y,
                              'w': r.width(),
                              'h': r.height()})
 
 
-x, y = 0, 0
 invT = None
 
 def main():
-    global x, y, invT, zoom
+    global invT, zoom
     with glfw_window() as window:
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         glfw.set_scroll_callback(window, scroll_callback)
@@ -278,7 +283,7 @@ def main():
                     dt = glfw.get_time() - last_frame
                     last_frame = glfw.get_time()
                     canvas.clear(skia.ColorWHITE)
-                    x, y = next(panner)
+                    dx, dy = next(panner)
 
                     if click_drag is not None:
                         try:
@@ -290,12 +295,13 @@ def main():
                         if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
                             click_drag = drag(window, selected)
 
-                    canvas.translate(WIDTH//2, HEIGHT//2)
+                    #canvas.translate(WIDTH//2, HEIGHT//2)
                     canvas.scale(zoom, zoom)
-                    canvas.translate(-(WIDTH//2), -(HEIGHT//2))
-                    canvas.translate(x, y)
+                    #canvas.translate(-(WIDTH//2), -(HEIGHT//2))
+                    canvas.translate(dx / canvas.getTotalMatrix().getScaleX(),
+                                     dy / canvas.getTotalMatrix().getScaleX())
 
-                    # reset transforms
+                    # reset transform
                     zoom = 1
 
                     # FIXME: a gross hack
