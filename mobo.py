@@ -1,6 +1,7 @@
 import contextlib
 import glfw
 import skia
+import os
 from OpenGL import GL
 import apsw
 import sqlite_utils
@@ -71,15 +72,14 @@ db.create_table(
                'x': int, 'y': int, 'w': int, 'h': int},
     pk='id')
 
-WIDTH, HEIGHT = 800, 600
-
 
 @contextlib.contextmanager
 def glfw_window():
     if not glfw.init():
         raise RuntimeError('glfw.init() failed')
     glfw.window_hint(glfw.STENCIL_BITS, 8)
-    window = glfw.create_window(WIDTH, HEIGHT, '', None, None)
+    w, h = 800, 600
+    window = glfw.create_window(w, h, '', None, None)
     glfw.make_context_current(window)
     yield window
     glfw.terminate()
@@ -89,8 +89,7 @@ def glfw_window():
 def skia_surface(window):
     context = skia.GrDirectContext.MakeGL()
     backend_render_target = skia.GrBackendRenderTarget(
-        WIDTH,
-        HEIGHT,
+        *glfw.get_window_size(window),
         0,  # sampleCnt
         0,  # stencilBits
         skia.GrGLFramebufferInfo(0, GL.GL_RGBA8))
@@ -199,7 +198,7 @@ def get_renderable(resource_path: str):
     if resource_path.endswith(('.png', '.jpg', '.jpeg')):
         renderables[resource_path] = load_img(resource_path)
         return renderables[resource_path]
-    elif resource_path.endswith(('.mp4',)):
+    elif resource_path.endswith(('.mp4', '.webm')):
         renderables[resource_path] = Video(resource_path)
         return renderables[resource_path].render_frame()
     else:
@@ -212,6 +211,10 @@ paint = skia.Paint(
     StrokeWidth=4,
     Color=skia.ColorRED
 )
+
+
+text_paint = skia.Paint(AntiAlias=True, Color=skia.ColorGRAY)
+text_font = skia.Font(None, 16, 1, 0)
 
 
 def render_frame(canvas, selected):
@@ -295,23 +298,90 @@ def drop_callback(window, paths):
                          'h': r.height()})
 
 
+def eval_prompt(prompt):
+    print('eval ', prompt)
+
+
 def key_callback(window, key, scancode, action, mod):
+    width, height = glfw.get_window_size(window)
     # TODO: add image support (using a proper clipboard management library)
     if mod == glfw.MOD_CONTROL and key == glfw.KEY_V and action == glfw.PRESS:
         s = glfw.get_clipboard_string(window).decode('utf-8')
         r = get_renderable(s)
-        x, y = to_global((WIDTH//2, HEIGHT//2))
+        x, y = to_global(glfw.get_window_size(window))
         db['images'].insert({'image': s,
                              'x': x,
                              'y': y,
                              'w': r.width(),
                              'h': r.height()})
 
+    global prompt
+    if key == glfw.KEY_BACKSPACE and action in (glfw.PRESS, glfw.REPEAT):
+        prompt = prompt[:-1]
+    if key == glfw.KEY_ENTER and action == glfw.PRESS:
+        eval_prompt(prompt)
+        prompt = ''
 
-invT = None
+
+def char_callback(window, codepoint):
+    global prompt
+    prompt += chr(codepoint)
+
+
+invT = skia.Matrix()
+
+prompt = ''
+select_data = os.listdir()
+select_i = 0
+
+
+@dataclass
+class Bounds:
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+
+    def remove_from_top(self, height):
+        self.y1 += height
+        return Bounds(self.x1, self.y1 - height, self.x2, self.y1)
+
+    def remove_from_bottom(self, height):
+        self.y2 -= height
+        return Bounds(self.x1, self.y2, self.x2, self.y2 + height)
+
+    def __iter__(self):
+        yield self.x1
+        yield self.y1
+        yield self.x2
+        yield self.y2
+
+    def to_rect(self):
+        return skia.Rect(self.x1, self.y1, self.x2, self.y2)
+
+
+context = None
+canvas = None
+surface = None
+
+
+def resize_callback(window, w, h):
+    global context, canvas, surface
+    backend_render_target = skia.GrBackendRenderTarget(
+        w,
+        h,
+        0,  # sampleCnt
+        0,  # stencilBits
+        skia.GrGLFramebufferInfo(0, GL.GL_RGBA8))
+    surface = skia.Surface.MakeFromBackendRenderTarget(
+        context, backend_render_target, skia.kBottomLeft_GrSurfaceOrigin,
+        skia.kRGBA_8888_ColorType, skia.ColorSpace.MakeSRGB())
+    assert surface is not None
+    canvas = surface.getCanvas()
+
 
 def main():
-    global invT, zoom
+    global invT, zoom, context
     with glfw_window() as window:
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         glfw.set_scroll_callback(window, scroll_callback)
@@ -319,43 +389,87 @@ def main():
         selector = select(window)
         glfw.set_drop_callback(window, drop_callback)
         glfw.set_key_callback(window, key_callback)
+        glfw.set_char_callback(window, char_callback)
+        glfw.set_window_size_callback(window, resize_callback)
 
         click_drag = None
-        with skia_surface(window) as surface:
-            with surface as canvas:
-                while (glfw.get_key(window, glfw.KEY_ESCAPE) != glfw.PRESS
-                       and not glfw.window_should_close(window)):
-                    canvas.clear(skia.ColorWHITE)
-                    dx, dy = next(panner)
 
-                    if click_drag is not None:
-                        try:
-                            next(click_drag)
-                        except StopIteration:
-                            click_drag = None
-                    else:
-                        selected = next(selector)
-                        if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
-                            click_drag = drag(window, selected)
+        context = skia.GrDirectContext.MakeGL()
+        resize_callback(window, *glfw.get_window_size(window))
 
-                    #canvas.translate(WIDTH//2, HEIGHT//2)
-                    canvas.scale(zoom, zoom)
-                    #canvas.translate(-(WIDTH//2), -(HEIGHT//2))
-                    canvas.translate(dx / canvas.getTotalMatrix().getScaleX(),
-                                     dy / canvas.getTotalMatrix().getScaleX())
+        while (glfw.get_key(window, glfw.KEY_ESCAPE) != glfw.PRESS
+               and not glfw.window_should_close(window)):
+            canvas.clear(skia.ColorWHITE)
 
-                    # reset transform
-                    zoom = 1
+            dx, dy = next(panner)
 
-                    # FIXME: a gross hack
-                    m = skia.Matrix()
-                    assert canvas.getTotalMatrix().invert(m)
-                    invT = m
+            if click_drag is not None:
+                try:
+                    next(click_drag)
+                except StopIteration:
+                    click_drag = None
+            else:
+                selected = next(selector)
+                if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
+                    click_drag = drag(window, selected)
 
-                    render_frame(canvas, selected)
-                    surface.flushAndSubmit()
-                    glfw.swap_buffers(window)
-                    glfw.poll_events()
+            # canvas.translate(WIDTH//2, HEIGHT//2)
+            canvas.scale(zoom, zoom)
+            # canvas.translate(-(WIDTH//2), -(HEIGHT//2))
+            canvas.translate(dx / canvas.getTotalMatrix().getScaleX(),
+                             dy / canvas.getTotalMatrix().getScaleX())
+
+            # reset transform
+            zoom = 1
+
+            # FIXME: a gross hack
+            m = skia.Matrix()
+            assert canvas.getTotalMatrix().invert(m)
+            invT = m
+
+            render_frame(canvas, selected)
+
+            canvas.save()
+            canvas.resetMatrix()
+
+            bounds = Bounds(0, 0, *glfw.get_window_size(window))
+
+            # render fuzzy select dialog
+            fuzzy_bounds = bounds.remove_from_bottom(200)
+            canvas.drawRect(skia.Rect(0, 0, 10, 10), skia.Paint(
+                Color=skia.ColorBLACK))
+            canvas.drawRect(
+                fuzzy_bounds.to_rect(),
+                skia.Paint(Color=skia.ColorBLACK)
+            )
+
+            prompt_bounds = fuzzy_bounds.remove_from_top(
+                text_font.getSpacing())
+            if prompt:
+                blob = skia.TextBlob(prompt, text_font)
+                canvas.drawTextBlob(
+                    blob, 5, prompt_bounds.y2 - text_font.getMetrics().fDescent, text_paint)
+
+            for i, d in enumerate((d for d in select_data if prompt in d) if prompt else select_data):
+                row_bounds = fuzzy_bounds.remove_from_top(
+                    text_font.getSpacing())
+                if i == select_i:
+                    canvas.drawRect(row_bounds.to_rect(),
+                                    skia.Paint(Color=skia.ColorBLUE))
+                blob = skia.TextBlob(d, text_font)
+                canvas.drawTextBlob(
+                    blob,
+                    5, row_bounds.y2 - text_font.getMetrics().fDescent,
+                    text_paint)
+
+            canvas.restore()
+
+            surface.flushAndSubmit()
+            glfw.swap_buffers(window)
+            glfw.poll_events()
+
+        # be nice and cleanup
+        context.abandonContext()
 
 
 if __name__ == '__main__':
