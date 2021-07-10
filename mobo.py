@@ -2,6 +2,7 @@ import contextlib
 import glfw
 import skia
 from OpenGL import GL
+import apsw
 import sqlite_utils
 import requests
 import twitter_session
@@ -9,8 +10,60 @@ import av
 from dataclasses import dataclass
 from PIL import Image
 
-db = sqlite_utils.Database(':memory:')
 
+class WrappedCursor(object):
+    '''A disguisting hack to make sqlite-utils happy when using an 
+    apsw.Connection.'''
+
+    def __init__(self, obj):
+        self._wrapped_obj = obj
+        self._desc = None
+
+    def __getattr__(self, attr):
+        if attr in self.__dict__:
+            return getattr(self, attr)
+        return getattr(self._wrapped_obj, attr)
+
+    @property
+    def description(self):
+        return self._desc
+
+    def __iter__(self):
+        return self._wrapped_obj.__iter__()
+
+    @property
+    def lastrowid(self):
+        return self.getconnection().last_insert_rowid()
+
+    @property
+    def rowcount(self):
+        # make sqlite-utils happy, i guess? ¯\_(ツ)_/¯
+        # https://github.com/simonw/sqlite-utils/blob/747be6057d09a4e5d9d726e29d5cf99b10c59dea/sqlite_utils/db.py#L1696
+        return 1
+
+
+class WrappedConnection(apsw.Connection):
+    def execute(self, *args):
+        c = self.cursor()
+        w = WrappedCursor(c)
+
+        def exectrace(cursor, sql, bindings):
+            w._desc = cursor.description
+            return True
+
+        c.setexectrace(exectrace)
+
+        c.execute(*args)
+        return w
+
+
+def updatef(ty, dbname, tablename, rowid):
+    print(ty, dbname, tablename, rowid)
+
+
+db_conn = WrappedConnection(':memory:')
+db_conn.setupdatehook(updatef)
+db = sqlite_utils.Database(db_conn)
 tsession = twitter_session.TwitterSession()
 
 db.create_table(
@@ -94,11 +147,6 @@ class Video:
         self.framerate = stream.average_rate
 
     def render_frame(self) -> skia.Image:
-        # FIXME: if we have multiple instances of a video, all the videos will
-        # play back at an accelerated speed because dt will be added multiple
-        # times. Probably smarter to apply update logic separately from
-        # rendering.
-
         # FIXME: this function is hot garbage.
         # there's so much potential for things to end up out of sync
         # (e.g. frames/cur frame data/which stream we use, etc)
@@ -107,6 +155,7 @@ class Video:
 
         assert self.cur_frame_data
         self.time = glfw.get_time()
+        assert self.frames > 0
         goal_frame = int(self.time * self.framerate) % self.frames
 
         if self.cur_frame == goal_frame:
