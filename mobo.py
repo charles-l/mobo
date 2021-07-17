@@ -27,10 +27,15 @@ paint = skia.Paint(
 )
 
 zoom = 1
+origin = (0, 0)
 invT = skia.Matrix()
+
+# TODO: figure out a better way of message passing than creating a new
+# queue for each message type
 char_queue = asyncio.Queue()
 key_queue = asyncio.Queue()
 draw_queue = asyncio.Queue()
+scroll_queue = asyncio.Queue()
 
 context = None
 canvas = None
@@ -167,10 +172,7 @@ def get_renderable(resource_path: str):
 
 
 def scroll_callback(window, xoffset, yoffset):
-    global zoom
-    zoom += yoffset * 0.05
-    if zoom < 0.04:
-        zoom = 0.04
+    scroll_queue.put_nowait((xoffset, yoffset))
 
 
 def pan(window):
@@ -290,7 +292,10 @@ def resize_callback(window, w, h):
         context, backend_render_target, skia.kBottomLeft_GrSurfaceOrigin,
         skia.kRGBA_8888_ColorType, skia.ColorSpace.MakeSRGB())
     assert surface is not None
+
     canvas = surface.getCanvas()
+    canvas.translate(origin[0], origin[1])
+    canvas.scale(zoom, zoom)
 
 
 async def select_box(window, select_data):
@@ -379,7 +384,7 @@ async def handle_events(window):
 
 
 async def draw_loop(window):
-    global invT, zoom
+    global invT, zoom, origin
 
     panner = pan(window)
     selector = select(window)
@@ -391,6 +396,7 @@ async def draw_loop(window):
         canvas.clear(skia.ColorWHITE)
 
         dx, dy = next(panner)
+        origin = (origin[0] + dx, origin[1] + dy)
 
         if click_drag is not None:
             try:
@@ -407,17 +413,21 @@ async def draw_loop(window):
                     db['images'].delete(image_id)
                     selected.remove(image_id)
 
-                # FIXME: this canvas.restore/canvas.save business is gross (and backwards)
+        # FIXME: this canvas.restore/canvas.save business is gross (and backwards)
         canvas.restore()
 
+        try:
+            dsy = scroll_queue.get_nowait()[1] * 0.05
+            zoom += (dsy * zoom)
+            dsy += 1
+        except asyncio.QueueEmpty:
+            dsy = 1
+
         # canvas.translate(WIDTH//2, HEIGHT//2)
-        canvas.scale(zoom, zoom)
+        canvas.scale(dsy, dsy)
         # canvas.translate(-(WIDTH//2), -(HEIGHT//2))
         canvas.translate(dx / canvas.getTotalMatrix().getScaleX(),
                          dy / canvas.getTotalMatrix().getScaleX())
-
-        # reset transform
-        zoom = 1
 
         # FIXME: a gross hack
         m = skia.Matrix()
