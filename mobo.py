@@ -166,38 +166,6 @@ def get_renderable(resource_path: str):
         raise ValueError('Unknown file type for ', resource_path)
 
 
-def render_frame(canvas, selected, dx, dy):
-    # FIXME: this canvas.restore/canvas.save business is gross (and backwards)
-    canvas.restore()
-
-    global zoom, invT
-    # canvas.translate(WIDTH//2, HEIGHT//2)
-    canvas.scale(zoom, zoom)
-    # canvas.translate(-(WIDTH//2), -(HEIGHT//2))
-    canvas.translate(dx / canvas.getTotalMatrix().getScaleX(),
-                     dy / canvas.getTotalMatrix().getScaleX())
-
-    # reset transform
-    zoom = 1
-
-    # FIXME: a gross hack
-    m = skia.Matrix()
-    assert canvas.getTotalMatrix().invert(m)
-    invT = m
-
-    for r in db['images'].rows:
-        img = get_renderable(r['image'])
-        canvas.drawImage(img, r['x'], r['y'], paint)
-        if r['id'] in selected:
-            canvas.drawRect(
-                skia.Rect(r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h']), paint)
-
-    canvas.save()
-    canvas.resetMatrix()
-    while render_overlays and (o := render_overlays.pop()):
-        o()
-
-
 def scroll_callback(window, xoffset, yoffset):
     global zoom
     zoom += yoffset * 0.05
@@ -408,11 +376,10 @@ async def handle_events(window):
                                            return_when=asyncio.FIRST_COMPLETED)
         for p in pending:
             p.cancel()
-        print("next")
 
 
 async def draw_loop(window):
-    global invT
+    global invT, zoom
 
     panner = pan(window)
     selector = select(window)
@@ -435,7 +402,39 @@ async def draw_loop(window):
             if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
                 click_drag = drag(window, selected)
 
-        render_frame(canvas, selected, dx, dy)
+            if glfw.get_key(window, glfw.KEY_DELETE) == glfw.PRESS or glfw.get_key(window, glfw.KEY_BACKSPACE) == glfw.PRESS:
+                for image_id in list(selected):
+                    db['images'].delete(image_id)
+                    selected.remove(image_id)
+
+                # FIXME: this canvas.restore/canvas.save business is gross (and backwards)
+        canvas.restore()
+
+        # canvas.translate(WIDTH//2, HEIGHT//2)
+        canvas.scale(zoom, zoom)
+        # canvas.translate(-(WIDTH//2), -(HEIGHT//2))
+        canvas.translate(dx / canvas.getTotalMatrix().getScaleX(),
+                         dy / canvas.getTotalMatrix().getScaleX())
+
+        # reset transform
+        zoom = 1
+
+        # FIXME: a gross hack
+        m = skia.Matrix()
+        assert canvas.getTotalMatrix().invert(m)
+        invT = m
+
+        for r in db['images'].rows:
+            img = get_renderable(r['image'])
+            canvas.drawImage(img, r['x'], r['y'], paint)
+            if r['id'] in selected:
+                canvas.drawRect(
+                    skia.Rect(r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h']), paint)
+
+        canvas.save()
+        canvas.resetMatrix()
+        while render_overlays and (o := render_overlays.pop()):
+            o()
 
         surface.flushAndSubmit()
         glfw.swap_buffers(window)
