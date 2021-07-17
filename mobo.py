@@ -161,7 +161,7 @@ def get_renderable(resource_path: str):
             return renderables[resource_path].render_frame()
         else:
             return renderables[resource_path]
-    if resource_path.endswith(('.png', '.jpg', '.jpeg')):
+    if resource_path.startswith('https://twitter.com') or resource_path.endswith(('.png', '.jpg', '.jpeg')):
         renderables[resource_path] = load_img(resource_path)
         return renderables[resource_path]
     elif resource_path.endswith(('.mp4', '.webm')):
