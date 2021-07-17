@@ -1,77 +1,40 @@
 import contextlib
+import asyncio
 import glfw
 import skia
 import os
 from OpenGL import GL
-import apsw
-import sqlite_utils
 import requests
 import twitter_session
 import av
-import queue
 from dataclasses import dataclass
 from PIL import Image
 
+import mobodb
 
-class WrappedCursor(object):
-    '''A disguisting hack to make sqlite-utils happy when using an 
-    apsw.Connection.'''
-
-    def __init__(self, obj):
-        self._wrapped_obj = obj
-        self._desc = None
-
-    def __getattr__(self, attr):
-        if attr in self.__dict__:
-            return getattr(self, attr)
-        return getattr(self._wrapped_obj, attr)
-
-    @property
-    def description(self):
-        return self._desc
-
-    def __iter__(self):
-        return self._wrapped_obj.__iter__()
-
-    @property
-    def lastrowid(self):
-        return self.getconnection().last_insert_rowid()
-
-    @property
-    def rowcount(self):
-        # make sqlite-utils happy, i guess? ¯\_(ツ)_/¯
-        # https://github.com/simonw/sqlite-utils/blob/747be6057d09a4e5d9d726e29d5cf99b10c59dea/sqlite_utils/db.py#L1696
-        return 1
-
-
-class WrappedConnection(apsw.Connection):
-    def execute(self, *args):
-        c = self.cursor()
-        w = WrappedCursor(c)
-
-        def exectrace(cursor, sql, bindings):
-            w._desc = cursor.description
-            return True
-
-        c.setexectrace(exectrace)
-
-        c.execute(*args)
-        return w
-
-
-def updatef(ty, dbname, tablename, rowid):
-    print(ty, dbname, tablename, rowid)
-
-
-db_conn = WrappedConnection(':memory:')
-db_conn.setupdatehook(updatef)
-db = sqlite_utils.Database(db_conn)
+db = mobodb.load_db(':memory:')
 tsession = twitter_session.TwitterSession()
+render_overlays = []
+renderables = {}
 
-db.create_table(
-    'images', {'id': int, 'image': str,
-               'x': int, 'y': int, 'w': int, 'h': int},
-    pk='id')
+text_paint = skia.Paint(AntiAlias=True, Color=skia.ColorGRAY)
+text_font = skia.Font(None, 16, 1, 0)
+paint = skia.Paint(
+    AntiAlias=True,
+    Style=skia.Paint.kStroke_Style,
+    StrokeWidth=4,
+    Color=skia.ColorRED
+)
+
+zoom = 1
+invT = skia.Matrix()
+char_queue = asyncio.Queue()
+key_queue = asyncio.Queue()
+draw_queue = asyncio.Queue()
+
+context = None
+canvas = None
+surface = None
 
 
 @contextlib.contextmanager
@@ -185,9 +148,6 @@ class Video:
         self.container.close()
 
 
-renderables = {}
-
-
 def get_renderable(resource_path: str):
     if resource_path in renderables:
         # TODO: create a class for Image so we don't have to conditonally call
@@ -206,19 +166,25 @@ def get_renderable(resource_path: str):
         raise ValueError('Unknown file type for ', resource_path)
 
 
-paint = skia.Paint(
-    AntiAlias=True,
-    Style=skia.Paint.kStroke_Style,
-    StrokeWidth=4,
-    Color=skia.ColorRED
-)
+def render_frame(canvas, selected, dx, dy):
+    # FIXME: this canvas.restore/canvas.save business is gross (and backwards)
+    canvas.restore()
 
+    global zoom, invT
+    # canvas.translate(WIDTH//2, HEIGHT//2)
+    canvas.scale(zoom, zoom)
+    # canvas.translate(-(WIDTH//2), -(HEIGHT//2))
+    canvas.translate(dx / canvas.getTotalMatrix().getScaleX(),
+                     dy / canvas.getTotalMatrix().getScaleX())
 
-text_paint = skia.Paint(AntiAlias=True, Color=skia.ColorGRAY)
-text_font = skia.Font(None, 16, 1, 0)
+    # reset transform
+    zoom = 1
 
+    # FIXME: a gross hack
+    m = skia.Matrix()
+    assert canvas.getTotalMatrix().invert(m)
+    invT = m
 
-def render_frame(canvas, selected):
     for r in db['images'].rows:
         img = get_renderable(r['image'])
         canvas.drawImage(img, r['x'], r['y'], paint)
@@ -226,8 +192,10 @@ def render_frame(canvas, selected):
             canvas.drawRect(
                 skia.Rect(r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h']), paint)
 
-
-zoom = 1
+    canvas.save()
+    canvas.resetMatrix()
+    while render_overlays and (o := render_overlays.pop()):
+        o()
 
 
 def scroll_callback(window, xoffset, yoffset):
@@ -276,9 +244,6 @@ def drag(window, selected):
         yield
 
 
-invT = skia.Matrix()
-
-
 def select(window):
     selected = set()
     while True:
@@ -299,12 +264,7 @@ def drop_callback(window, paths):
                          'h': r.height()})
 
 
-char_queue = queue.Queue()
-key_queue = queue.Queue()
-
-
 def key_callback(window, key, scancode, action, mod):
-    global select_i
     key_queue.put_nowait((key, action, mod))
     # TODO: move this stuff somewhere else and use the key_queue
     # TODO: add image support (using a proper clipboard management library)
@@ -323,9 +283,6 @@ def key_callback(window, key, scancode, action, mod):
 def char_callback(window, codepoint):
     global prompt
     char_queue.put_nowait(chr(codepoint))
-
-
-invT = skia.Matrix()
 
 
 @dataclass
@@ -353,11 +310,6 @@ class Bounds:
         return skia.Rect(self.x1, self.y1, self.x2, self.y2)
 
 
-context = None
-canvas = None
-surface = None
-
-
 def resize_callback(window, w, h):
     global context, canvas, surface
     backend_render_target = skia.GrBackendRenderTarget(
@@ -373,30 +325,12 @@ def resize_callback(window, w, h):
     canvas = surface.getCanvas()
 
 
-def select_box(window, select_data):
+async def select_box(window, select_data):
     prompt = ''
     select_i = 0
-    while not glfw.get_key(window, glfw.KEY_ENTER) == glfw.PRESS:
-        while True:
-            try:
-                key, action, mod = key_queue.get_nowait()
-                if key == glfw.KEY_BACKSPACE and action in (glfw.PRESS, glfw.REPEAT):
-                    prompt = prompt[:-1]
-                if key == glfw.KEY_UP and action == glfw.PRESS:
-                    select_i -= 1
-                if key == glfw.KEY_DOWN and action == glfw.PRESS:
-                    select_i += 1
-            except queue.Empty:
-                break
 
+    def draw_overlay(data):
         bounds = Bounds(0, 0, *glfw.get_window_size(window))
-        while True:
-            try:
-                char = char_queue.get_nowait()
-                prompt += char
-            except queue.Empty:
-                break
-
         fuzzy_bounds = bounds.remove_from_bottom(200)
         canvas.drawRect(
             fuzzy_bounds.to_rect(),
@@ -409,9 +343,6 @@ def select_box(window, select_data):
             canvas.drawTextBlob(
                 blob, 5, prompt_bounds.y2 - text_font.getMetrics().fDescent, text_paint)
 
-        data = [d for d in select_data if prompt in d] if prompt else select_data
-        select_i = -1 if select_i < -1 else select_i
-        select_i = len(data) - 1 if select_i >= len(data) else select_i
         for i, d in enumerate(data):
             row_bounds = fuzzy_bounds.remove_from_top(
                 text_font.getSpacing())
@@ -424,92 +355,118 @@ def select_box(window, select_data):
                 5, row_bounds.y2 - text_font.getMetrics().fDescent,
                 text_paint)
 
-        yield
+    while not glfw.get_key(window, glfw.KEY_ENTER) == glfw.PRESS:
+        # FIXME: bad bad bad
+        await asyncio.sleep(0.01)
+        print(f'{prompt=}')
+        while True:
+            try:
+                # FIXME: selectbox/handle_events stomp the key_queue for each other right now
+                key, action, mod = key_queue.get_nowait()
+                if key == glfw.KEY_BACKSPACE and action in (glfw.PRESS, glfw.REPEAT):
+                    prompt = prompt[:-1]
+                if key == glfw.KEY_UP and action == glfw.PRESS:
+                    select_i -= 1
+                if key == glfw.KEY_DOWN and action == glfw.PRESS:
+                    select_i += 1
+            except asyncio.QueueEmpty:
+                break
+
+        while True:
+            try:
+                char = char_queue.get_nowait()
+                prompt += char
+            except asyncio.QueueEmpty:
+                break
+
+        data = [d for d in select_data if prompt in d] if prompt else select_data
+        select_i = -1 if select_i < -1 else select_i
+        select_i = len(data) - 1 if select_i >= len(data) else select_i
+
+        render_overlays.append(lambda: draw_overlay(data))
+    if select_i == -1:
+        return prompt
+    else:
+        return data[select_i]
 
 
-'''
-if key_pressed('ctrl-o'):
-    file = await select_box(window, os.listdir())
-    load_file(file)
-'''
+async def handle_events(window):
+    async def open_file():
+        global db
+        file = await select_box(window, os.listdir())
+        db.conn.close()
+        db = mobodb.load_db(file)
+
+    async def handle_keys():
+        key, action, mod = await key_queue.get()
+        if (mod, key, action) == (glfw.MOD_CONTROL, glfw.KEY_O, glfw.PRESS):
+            await open_file()
+
+    while True:
+        tasks = [asyncio.create_task(handle_keys())]
+        done, pending = await asyncio.wait(tasks,
+                                           return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+        print("next")
 
 
-def main():
-    global invT, zoom, context, select_i
+async def draw_loop(window):
+    global invT
 
-    floating_elements = []
+    panner = pan(window)
+    selector = select(window)
+    click_drag = None
+    while True:
+        # wait for next redraw request
+        # await draw_queue.get()
+        await asyncio.sleep(0.001)
+        canvas.clear(skia.ColorWHITE)
+
+        dx, dy = next(panner)
+
+        if click_drag is not None:
+            try:
+                next(click_drag)
+            except StopIteration:
+                click_drag = None
+        else:
+            selected = next(selector)
+            if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
+                click_drag = drag(window, selected)
+
+        render_frame(canvas, selected, dx, dy)
+
+        surface.flushAndSubmit()
+        glfw.swap_buffers(window)
+
+
+async def main():
+    global context
 
     with glfw_window() as window:
+        asyncio.create_task(handle_events(window))
+        asyncio.create_task(draw_loop(window))
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         glfw.set_scroll_callback(window, scroll_callback)
-        panner = pan(window)
-        selector = select(window)
         glfw.set_drop_callback(window, drop_callback)
         glfw.set_key_callback(window, key_callback)
         glfw.set_char_callback(window, char_callback)
         glfw.set_window_size_callback(window, resize_callback)
 
-        click_drag = None
-
         context = skia.GrDirectContext.MakeGL()
         resize_callback(window, *glfw.get_window_size(window))
 
-        floating_elements.append(select_box(window, os.listdir()))
-
-        while (glfw.get_key(window, glfw.KEY_ESCAPE) != glfw.PRESS
-               and not glfw.window_should_close(window)):
-            canvas.clear(skia.ColorWHITE)
-
-            dx, dy = next(panner)
-
-            if click_drag is not None:
-                try:
-                    next(click_drag)
-                except StopIteration:
-                    click_drag = None
-            else:
-                selected = next(selector)
-                if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
-                    click_drag = drag(window, selected)
-
-            # canvas.translate(WIDTH//2, HEIGHT//2)
-            canvas.scale(zoom, zoom)
-            # canvas.translate(-(WIDTH//2), -(HEIGHT//2))
-            canvas.translate(dx / canvas.getTotalMatrix().getScaleX(),
-                             dy / canvas.getTotalMatrix().getScaleX())
-
-            # reset transform
-            zoom = 1
-
-            # FIXME: a gross hack
-            m = skia.Matrix()
-            assert canvas.getTotalMatrix().invert(m)
-            invT = m
-
-            render_frame(canvas, selected)
-
-            canvas.save()
-            canvas.resetMatrix()
-
-            new_floating_elements = []
-            for e in floating_elements:
-                try:
-                    next(e)
-                except StopIteration:
-                    pass
-                else:
-                    new_floating_elements.append(e)
-            floating_elements = new_floating_elements
-
-            canvas.restore()
-
-            surface.flushAndSubmit()
-            glfw.swap_buffers(window)
+        while not glfw.window_should_close(window):
             glfw.poll_events()
+            await asyncio.sleep(0.001)
 
         # be nice and cleanup
         context.abandonContext()
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    if len(sys.argv) == 2:
+        db = mobodb.load_db(sys.argv[1])
+    asyncio.get_event_loop().run_until_complete(main())
