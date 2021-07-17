@@ -8,6 +8,7 @@ import sqlite_utils
 import requests
 import twitter_session
 import av
+import queue
 from dataclasses import dataclass
 from PIL import Image
 
@@ -298,41 +299,33 @@ def drop_callback(window, paths):
                          'h': r.height()})
 
 
-def eval_prompt(prompt):
-    print('eval ', prompt)
+char_queue = queue.Queue()
+key_queue = queue.Queue()
 
 
 def key_callback(window, key, scancode, action, mod):
-    width, height = glfw.get_window_size(window)
+    global select_i
+    key_queue.put_nowait((key, action, mod))
+    # TODO: move this stuff somewhere else and use the key_queue
     # TODO: add image support (using a proper clipboard management library)
     if mod == glfw.MOD_CONTROL and key == glfw.KEY_V and action == glfw.PRESS:
         s = glfw.get_clipboard_string(window).decode('utf-8')
         r = get_renderable(s)
-        x, y = to_global(glfw.get_window_size(window))
+        w, h = glfw.get_window_size(window)
+        x, y = to_global((w//2, h//2))
         db['images'].insert({'image': s,
                              'x': x,
                              'y': y,
                              'w': r.width(),
                              'h': r.height()})
 
-    global prompt
-    if key == glfw.KEY_BACKSPACE and action in (glfw.PRESS, glfw.REPEAT):
-        prompt = prompt[:-1]
-    if key == glfw.KEY_ENTER and action == glfw.PRESS:
-        eval_prompt(prompt)
-        prompt = ''
-
 
 def char_callback(window, codepoint):
     global prompt
-    prompt += chr(codepoint)
+    char_queue.put_nowait(chr(codepoint))
 
 
 invT = skia.Matrix()
-
-prompt = ''
-select_data = os.listdir()
-select_i = 0
 
 
 @dataclass
@@ -380,8 +373,72 @@ def resize_callback(window, w, h):
     canvas = surface.getCanvas()
 
 
+def select_box(window, select_data):
+    prompt = ''
+    select_i = 0
+    while not glfw.get_key(window, glfw.KEY_ENTER) == glfw.PRESS:
+        while True:
+            try:
+                key, action, mod = key_queue.get_nowait()
+                if key == glfw.KEY_BACKSPACE and action in (glfw.PRESS, glfw.REPEAT):
+                    prompt = prompt[:-1]
+                if key == glfw.KEY_UP and action == glfw.PRESS:
+                    select_i -= 1
+                if key == glfw.KEY_DOWN and action == glfw.PRESS:
+                    select_i += 1
+            except queue.Empty:
+                break
+
+        bounds = Bounds(0, 0, *glfw.get_window_size(window))
+        while True:
+            try:
+                char = char_queue.get_nowait()
+                prompt += char
+            except queue.Empty:
+                break
+
+        fuzzy_bounds = bounds.remove_from_bottom(200)
+        canvas.drawRect(
+            fuzzy_bounds.to_rect(),
+            skia.Paint(Color=skia.ColorBLACK))
+
+        prompt_bounds = fuzzy_bounds.remove_from_top(
+            text_font.getSpacing())
+        if prompt:
+            blob = skia.TextBlob(prompt, text_font)
+            canvas.drawTextBlob(
+                blob, 5, prompt_bounds.y2 - text_font.getMetrics().fDescent, text_paint)
+
+        data = [d for d in select_data if prompt in d] if prompt else select_data
+        select_i = -1 if select_i < -1 else select_i
+        select_i = len(data) - 1 if select_i >= len(data) else select_i
+        for i, d in enumerate(data):
+            row_bounds = fuzzy_bounds.remove_from_top(
+                text_font.getSpacing())
+            if i == select_i:
+                canvas.drawRect(row_bounds.to_rect(),
+                                skia.Paint(Color=skia.ColorBLUE))
+            blob = skia.TextBlob(d, text_font)
+            canvas.drawTextBlob(
+                blob,
+                5, row_bounds.y2 - text_font.getMetrics().fDescent,
+                text_paint)
+
+        yield
+
+
+'''
+if key_pressed('ctrl-o'):
+    file = await select_box(window, os.listdir())
+    load_file(file)
+'''
+
+
 def main():
-    global invT, zoom, context
+    global invT, zoom, context, select_i
+
+    floating_elements = []
+
     with glfw_window() as window:
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         glfw.set_scroll_callback(window, scroll_callback)
@@ -396,6 +453,8 @@ def main():
 
         context = skia.GrDirectContext.MakeGL()
         resize_callback(window, *glfw.get_window_size(window))
+
+        floating_elements.append(select_box(window, os.listdir()))
 
         while (glfw.get_key(window, glfw.KEY_ESCAPE) != glfw.PRESS
                and not glfw.window_should_close(window)):
@@ -432,35 +491,15 @@ def main():
             canvas.save()
             canvas.resetMatrix()
 
-            bounds = Bounds(0, 0, *glfw.get_window_size(window))
-
-            # render fuzzy select dialog
-            fuzzy_bounds = bounds.remove_from_bottom(200)
-            canvas.drawRect(skia.Rect(0, 0, 10, 10), skia.Paint(
-                Color=skia.ColorBLACK))
-            canvas.drawRect(
-                fuzzy_bounds.to_rect(),
-                skia.Paint(Color=skia.ColorBLACK)
-            )
-
-            prompt_bounds = fuzzy_bounds.remove_from_top(
-                text_font.getSpacing())
-            if prompt:
-                blob = skia.TextBlob(prompt, text_font)
-                canvas.drawTextBlob(
-                    blob, 5, prompt_bounds.y2 - text_font.getMetrics().fDescent, text_paint)
-
-            for i, d in enumerate((d for d in select_data if prompt in d) if prompt else select_data):
-                row_bounds = fuzzy_bounds.remove_from_top(
-                    text_font.getSpacing())
-                if i == select_i:
-                    canvas.drawRect(row_bounds.to_rect(),
-                                    skia.Paint(Color=skia.ColorBLUE))
-                blob = skia.TextBlob(d, text_font)
-                canvas.drawTextBlob(
-                    blob,
-                    5, row_bounds.y2 - text_font.getMetrics().fDescent,
-                    text_paint)
+            new_floating_elements = []
+            for e in floating_elements:
+                try:
+                    next(e)
+                except StopIteration:
+                    pass
+                else:
+                    new_floating_elements.append(e)
+            floating_elements = new_floating_elements
 
             canvas.restore()
 
