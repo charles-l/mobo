@@ -55,8 +55,9 @@ def load_db(dbfile):
     if not db['images'].exists():
         db.create_table(
             'images', {'id': int, 'asset_id': str,
-                       'x': int, 'y': int, 'w': int, 'h': int},
+                       'x': int, 'y': int, 'z': int, 'w': int, 'h': int},
             pk='id')
+        db['images'].create_index(['z'])
     if not db['assets'].exists():
         db.create_table(
             'assets', {'id': str, 'blob': 'BLOB',

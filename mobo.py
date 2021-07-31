@@ -281,8 +281,8 @@ def select(window):
     while True:
         if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
             mosx, mosy = to_global(glfw.get_cursor_pos(window))
-            selected = {x['id'] for x in db['images'].rows_where(
-                '? between x and x + w and ? between y and y + h', [mosx, mosy])}
+            selected = {x[0] for x in db.execute(
+                'select id, max(z) from images where ? between x and x + w and ? between y and y + h', [mosx, mosy]).fetchall()}
         yield selected
 
 
@@ -293,6 +293,7 @@ def drop_callback(window, paths):
     db['images'].insert({'asset_id': asset_id,
                          'x': x,
                          'y': y,
+                         'z': db.execute('select max(z)+1 from images').fetchone()[0],
                          'w': r.width(),
                          'h': r.height()})
 
@@ -310,6 +311,7 @@ def key_callback(window, key, scancode, action, mod):
         db['images'].insert({'asset_id': asset_id,
                              'x': x,
                              'y': y,
+                             'z': db.execute('select max(z)+1 from images').fetchone()[0],
                              'w': r.width(),
                              'h': r.height()})
 
@@ -477,7 +479,6 @@ async def draw_loop(window):
                     db['images'].delete(image_id)
                     selected.remove(image_id)
 
-        # FIXME: this canvas.restore/canvas.save business is gross (and backwards)
         canvas.restore()
 
         try:
@@ -498,7 +499,7 @@ async def draw_loop(window):
         assert canvas.getTotalMatrix().invert(m)
         invT = m
 
-        for r in db['images'].rows:
+        for r in db['images'].rows_where(order_by='z'):
             img = get_renderable(r['asset_id'])
             canvas.drawImage(img, r['x'], r['y'], paint)
             if r['id'] in selected:
