@@ -46,19 +46,22 @@ scroll_queue = asyncio.Queue()
 context = None
 canvas = None
 surface = None
+arrow_cursor = None
 
 
 @contextlib.contextmanager
 def glfw_window():
+    global arrow_cursor
     if not glfw.init():
         raise RuntimeError('glfw.init() failed')
+    arrow_cursor = glfw.create_standard_cursor(glfw.ARROW_CURSOR)
+
     glfw.window_hint(glfw.STENCIL_BITS, 8)
     w, h = 800, 600
     window = glfw.create_window(w, h, '', None, None)
     glfw.make_context_current(window)
     yield window
     glfw.terminate()
-
 
 @contextlib.contextmanager
 def skia_surface(window):
@@ -238,15 +241,25 @@ def scroll_callback(window, xoffset, yoffset):
 
 
 def pan(window):
+    def mouse_trigger():
+        return glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
+    def space_trigger():
+        return glfw.get_key(window, glfw.KEY_SPACE) == glfw.PRESS
     while True:
-        if (glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) ==
-                glfw.PRESS):
+        trigger = None
+        if mouse_trigger():
+            trigger = mouse_trigger
+        if space_trigger():
+            trigger = space_trigger
+
+        if trigger:
+            glfw.set_cursor(window, arrow_cursor)
             lastx, lasty = glfw.get_cursor_pos(window)
-            while (glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) ==
-                    glfw.PRESS):
+            while trigger():
                 x, y = glfw.get_cursor_pos(window)
                 yield (x - lastx, y - lasty)
                 lastx, lasty = x, y
+            glfw.set_cursor(window, None)
         yield (0, 0)
 
 
