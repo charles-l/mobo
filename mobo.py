@@ -2,20 +2,26 @@ import contextlib
 import asyncio
 import glfw
 import skia
+import io
 import os
+import re
+import hashlib
+from urllib.parse import urlparse
 from OpenGL import GL
 import requests
 import twitter_session
 import av
 from dataclasses import dataclass
-from PIL import Image
+import PIL.Image
+from typing import BinaryIO, Dict, Union
+from sqlite_utils.db import NotFoundError
 
 import mobodb
 
 db = mobodb.load_db(':memory:')
 tsession = twitter_session.TwitterSession()
 render_overlays = []
-renderables = {}
+renderables: Dict[str, Union['Video', 'Image']] = {}
 
 text_paint = skia.Paint(AntiAlias=True, Color=skia.ColorGRAY)
 text_font = skia.Font(None, 16, 1, 0)
@@ -70,28 +76,7 @@ def skia_surface(window):
     context.abandonContext()
 
 
-def load_img(path):
-    if path.startswith('https://twitter.com'):
-        components = path.removeprefix('https://twitter.com/').split('/')
-        assert components[1] == 'status'
-        tweet_id = components[2]
-        print(tsession.get_tweet(tweet_id)['extended_entities']['media'])
-        return load_img(tsession.get_tweet(tweet_id)['extended_entities']['media'][0]['media_url'])
-    elif path.startswith('http://') or path.startswith('https://'):
-        r = requests.get(path, stream=True)
-        r.raw.decode_contents = True
-        img = Image.open(r.raw)
-        print('downloaded image from ', path)
-        img = img.convert('RGBA')
-        return skia.Image.frombytes(img.tobytes(), img.size, skia.kRGBA_8888_ColorType)
-    elif path.startswith('/'):
-        return skia.Image.open(path)
-    else:
-        assert False, f'Unknown path type for: {path}'
-
-
 class Video:
-    path: str
     container: av.container.input.InputContainer
     cur_frame: int
     cur_frame_data: skia.Image
@@ -102,11 +87,10 @@ class Video:
         return skia.Image.fromarray(f,
                                     colorType=skia.ColorType.kBGRA_8888_ColorType)
 
-    def __init__(self, path: str):
-        self.path = str
+    def __init__(self, f: BinaryIO):
         self.time = 0
         self.cur_frame = 0
-        self.container = av.open(open(path, 'rb'))
+        self.container = av.open(f)
 
         stream = self.container.streams.video[0]
         self.frames = stream.frames
@@ -153,22 +137,100 @@ class Video:
         self.container.close()
 
 
-def get_renderable(resource_path: str):
-    if resource_path in renderables:
-        # TODO: create a class for Image so we don't have to conditonally call
-        # render_frame
-        if isinstance(renderables[resource_path], Video):
-            return renderables[resource_path].render_frame()
-        else:
-            return renderables[resource_path]
-    if resource_path.startswith('https://twitter.com') or resource_path.endswith(('.png', '.jpg', '.jpeg')):
-        renderables[resource_path] = load_img(resource_path)
-        return renderables[resource_path]
-    elif resource_path.endswith(('.mp4', '.webm')):
-        renderables[resource_path] = Video(resource_path)
-        return renderables[resource_path].render_frame()
+class Image:
+    image: skia.Image
+
+    def __init__(self, f: BinaryIO):
+        img = PIL.Image.open(f)
+        img = img.convert('RGBA')
+        self.image = skia.Image.frombytes(
+            img.tobytes(), img.size, skia.kRGBA_8888_ColorType)
+
+    def render_frame(self) -> skia.Image:
+        return self.image
+
+
+def _get_type(path):
+    # TODO: use libmagic to extract file type
+    if path.endswith(('.mp4', '.webm')):
+        return 'video'
+    elif path.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+        return 'image'
+    assert False
+
+
+def _get_or_insert_asset(source_path: str, f: BinaryIO):
+    # potential TODO: stream rather than loading whole buffer into memory
+    # although it will still be two passes anyway...
+    buf = f.read()
+    m = hashlib.sha256()
+    m.update(buf)
+    try:
+        db['assets'].get(m.hexdigest())
+    except NotFoundError:
+        db['assets'].insert({
+            'id': m.hexdigest(),
+            'blob': buf,
+            'source': source_path,
+            'type': _get_type(source_path)})
+    return m.hexdigest()
+
+
+def import_or_load_asset(resource_path: str):
+    # early exit case: db already has the asset imported
+    matching_assets = list(db['assets'].rows_where('source = ?', (resource_path,)))
+    if matching_assets:
+        print(resource_path, 'is already imported, skipping loading from path')
+        # I don't think it's possible to internally reach a state where duplicate
+        # resources for the same path would be loaded, but assert it for now.
+        #
+        # This might change in the future if external resources can be imported
+        # multiple times over time (e.g. to version control differences).
+        assert len(matching_assets) == 1
+        return matching_assets[0]['id']
+
+    if re.match(r'^https?://', resource_path):
+        # parse out resource
+        url = urlparse(resource_path)
+        download_path = resource_path
+        if url.netloc == 'twitter.com':
+            components = url.path.split('/')
+            if components[1] != 'status':
+                raise ValueError("Can't handle twitter path", url.path)
+            tweet_id = components[2]
+            print(tsession.get_tweet(tweet_id)['extended_entities']['media'])
+            download_path = tsession.get_tweet(
+                tweet_id)['extended_entities']['media'][0]['media_url']
+
+        # generic downloader
+        r = requests.get(download_path, stream=True)
+        r.raw.decode_contents = True
+        path, f = download_path, r.raw
     else:
-        raise ValueError('Unknown file type for ', resource_path)
+        if not os.path.exists(resource_path):
+            raise Exception("can't import", resource_path)
+        path, f = resource_path, open(resource_path, 'rb')
+
+    try:
+        return _get_or_insert_asset(path, f)
+    finally:
+        f.close()
+
+
+def get_renderable(asset_id: str):
+    if asset_id in renderables:  # already fetched
+        return renderables[asset_id].render_frame()
+
+    asset = db['assets'].get(asset_id)
+    blobf = io.BytesIO(asset['blob'])
+
+    if asset['type'] == 'image':
+        renderables[asset_id] = Image(blobf)
+    elif asset['type'] == 'video':
+        renderables[asset_id] = Video(blobf)
+    else:
+        raise ValueError('Unknown file type for ', asset_id)
+    return renderables[asset_id].render_frame()
 
 
 def scroll_callback(window, xoffset, yoffset):
@@ -225,9 +287,10 @@ def select(window):
 
 
 def drop_callback(window, paths):
-    r = get_renderable(paths[0])
+    asset_id = import_or_load_asset(paths[0])
+    r = get_renderable(asset_id)
     x, y = to_global(glfw.get_cursor_pos(window))
-    db['images'].insert({'image': paths[0],
+    db['images'].insert({'asset_id': asset_id,
                          'x': x,
                          'y': y,
                          'w': r.width(),
@@ -240,10 +303,11 @@ def key_callback(window, key, scancode, action, mod):
     # TODO: add image support (using a proper clipboard management library)
     if mod == glfw.MOD_CONTROL and key == glfw.KEY_V and action == glfw.PRESS:
         s = glfw.get_clipboard_string(window).decode('utf-8')
-        r = get_renderable(s)
+        asset_id = import_or_load_asset(s)
+        r = get_renderable(asset_id)
         w, h = glfw.get_window_size(window)
         x, y = to_global((w//2, h//2))
-        db['images'].insert({'image': s,
+        db['images'].insert({'asset_id': asset_id,
                              'x': x,
                              'y': y,
                              'w': r.width(),
@@ -435,7 +499,7 @@ async def draw_loop(window):
         invT = m
 
         for r in db['images'].rows:
-            img = get_renderable(r['image'])
+            img = get_renderable(r['asset_id'])
             canvas.drawImage(img, r['x'], r['y'], paint)
             if r['id'] in selected:
                 canvas.drawRect(

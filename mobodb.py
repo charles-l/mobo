@@ -54,8 +54,13 @@ def load_db(dbfile):
     db = sqlite_utils.Database(db_conn)
     if not db['images'].exists():
         db.create_table(
-            'images', {'id': int, 'image': str,
+            'images', {'id': int, 'asset_id': str,
                        'x': int, 'y': int, 'w': int, 'h': int},
+            pk='id')
+    if not db['assets'].exists():
+        db.create_table(
+            'assets', {'id': str, 'blob': 'BLOB',
+                       'source': str, 'type': str},
             pk='id')
     return db
 
