@@ -282,7 +282,7 @@ def select(window):
         if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
             mosx, mosy = to_global(glfw.get_cursor_pos(window))
             selected = {x[0] for x in db.execute(
-                'select id, max(z) from images where ? between x and x + w and ? between y and y + h', [mosx, mosy]).fetchall()}
+                'select id, z from images where ? between x and x + w and ? between y and y + h order by z desc limit 1', [mosx, mosy]).fetchall()}
         yield selected
 
 
@@ -293,7 +293,7 @@ def drop_callback(window, paths):
     db['images'].insert({'asset_id': asset_id,
                          'x': x,
                          'y': y,
-                         'z': db.execute('select max(z)+1 from images').fetchone()[0],
+                         'z': db.execute('select ifnull(max(z),0)+1 from images').fetchone()[0],
                          'w': r.width(),
                          'h': r.height()})
 
@@ -311,7 +311,7 @@ def key_callback(window, key, scancode, action, mod):
         db['images'].insert({'asset_id': asset_id,
                              'x': x,
                              'y': y,
-                             'z': db.execute('select max(z)+1 from images').fetchone()[0],
+                             'z': db.execute('select ifnull(max(z),0)+1 from images').fetchone()[0],
                              'w': r.width(),
                              'h': r.height()})
 
@@ -471,6 +471,23 @@ async def draw_loop(window):
                 click_drag = None
         else:
             selected = next(selector)
+
+            if selected:
+                if len(selected) == 1:
+                    # FIXME: only works when len(selected) = 1
+                    # FIXME: this swap should really be atomic...
+                    s_id, = selected
+                    s = db['images'].get(s_id)
+                    # lift the image z-index
+                    top_id, top_z = db.execute(
+                        'select id, z from images order by z desc'
+                        ).fetchone()
+                    if top_id != s_id:
+                        db['images'].update(s_id, {'z': top_z})
+                        db['images'].update(top_id, {'z': s['z']})
+                else:
+                    print("can't lift ", selected)
+
             if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
                 click_drag = drag(window, selected)
 
