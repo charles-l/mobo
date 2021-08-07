@@ -294,8 +294,15 @@ def select(window):
     while True:
         if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
             mosx, mosy = to_global(glfw.get_cursor_pos(window))
-            selected = {x[0] for x in db.execute(
+            new_selected = {x[0] for x in db.execute(
                 'select id, z from images where ? between x and x + w and ? between y and y + h order by z desc limit 1', [mosx, mosy]).fetchall()}
+            if len(new_selected) == 1 and next(iter(new_selected)) in selected:
+                yield selected
+                continue
+            if glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS:
+                selected |= new_selected
+            else:
+                selected = new_selected
         yield selected
 
 
@@ -486,20 +493,14 @@ async def draw_loop(window):
             selected = next(selector)
 
             if selected:
-                if len(selected) == 1:
-                    # FIXME: only works when len(selected) = 1
-                    # FIXME: this swap should really be atomic...
-                    s_id, = selected
-                    s = db['images'].get(s_id)
-                    # lift the image z-index
-                    top_id, top_z = db.execute(
-                        'select id, z from images order by z desc'
-                        ).fetchone()
-                    if top_id != s_id:
-                        db['images'].update(s_id, {'z': top_z})
-                        db['images'].update(top_id, {'z': s['z']})
-                else:
-                    print("can't lift ", selected)
+                top_z = db.execute('select max(z) from images').fetchone()[0]
+                sel_template = ','.join(['?'] * len(selected))
+                min_selected_z = db.execute(f'select min(z) from images where id in ({sel_template})', selected).fetchone()[0]
+                for i, img in enumerate(db['images'].rows_where(f'z > ? and id not in ({sel_template})', (min_selected_z, *selected))):
+                    db['images'].update(img['id'], {'z': min_selected_z + i})
+
+                for i, img in enumerate(db['images'].rows_where(f'id in ({sel_template})', selected, order_by='z')):
+                    db['images'].update(img['id'], {'z': top_z - len(selected) + i + 1})
 
             if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
                 click_drag = drag(window, selected)
