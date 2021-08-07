@@ -2,6 +2,7 @@ import contextlib
 import asyncio
 import glfw
 import skia
+import math
 import io
 import os
 import re
@@ -270,23 +271,39 @@ def to_global(p):
     return gx, gy
 
 
-def drag(window, selected):
+def drag_pos(window, end_trigger, selected):
     bindings = ','.join(['?'] * len(selected))
     start_pos = {r['id']: (r['x'], r['y']) for r in db['images'].rows_where(
         f'id in ({bindings})', list(selected))}
-    startx, starty = to_global(glfw.get_cursor_pos(window))
-    while True:
-        endx, endy = to_global(glfw.get_cursor_pos(window))
-        diffx, diffy = endx-startx, endy-starty
+    for diffx, diffy in drag(window, end_trigger):
         for image_id in selected:
             db['images'].update(image_id,
                                 {'x': start_pos[image_id][0] + diffx,
                                  'y': start_pos[image_id][1] + diffy})
-
-        if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) != glfw.PRESS:
-            return
-
         yield
+
+
+def drag_scale(window, end_trigger, selected):
+    bindings = ','.join(['?'] * len(selected))
+    start_scale = {r['id']: r['scale'] for r in db['images'].rows_where(
+        f'id in ({bindings})', list(selected))}
+    for diffx, diffy in drag(window, end_trigger):
+        for image_id in selected:
+            db['images'].update(image_id,
+                                {'scale': max(start_scale[image_id] + (diffx+diffy)/1000, 0.01)})
+        yield
+
+
+
+def drag(window, end_trigger):
+    startx, starty = to_global(glfw.get_cursor_pos(window))
+    while True:
+        endx, endy = to_global(glfw.get_cursor_pos(window))
+        diffx, diffy = endx-startx, endy-starty
+        yield diffx, diffy
+
+        if end_trigger():
+            return
 
 
 def select(window):
@@ -295,7 +312,7 @@ def select(window):
         if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
             mosx, mosy = to_global(glfw.get_cursor_pos(window))
             new_selected = {x[0] for x in db.execute(
-                'select id, z from images where ? between x and x + w and ? between y and y + h order by z desc limit 1', [mosx, mosy]).fetchall()}
+                'select id, z from images where ? between x and x + w*scale and ? between y and y + h*scale order by z desc limit 1', [mosx, mosy]).fetchall()}
             if len(new_selected) == 1 and next(iter(new_selected)) in selected:
                 yield selected
                 continue
@@ -503,7 +520,12 @@ async def draw_loop(window):
                     db['images'].update(img['id'], {'z': top_z - len(selected) + i + 1})
 
             if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
-                click_drag = drag(window, selected)
+                click_drag = drag_pos(window, lambda: glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) != glfw.PRESS,
+                                      selected)
+
+            if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS:
+                click_drag = drag_scale(window, lambda: glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) != glfw.PRESS,
+                                        selected)
 
             if glfw.get_key(window, glfw.KEY_DELETE) == glfw.PRESS or glfw.get_key(window, glfw.KEY_BACKSPACE) == glfw.PRESS:
                 for image_id in list(selected):
@@ -532,10 +554,15 @@ async def draw_loop(window):
 
         for r in db['images'].rows_where(order_by='z'):
             img = get_renderable(r['asset_id'])
-            canvas.drawImage(img, r['x'], r['y'], paint)
+
+            x, y, w, h = r['x'], r['y'], r['w'] * r['scale'], r['h'] * r['scale']
+
+            canvas.drawImageRect(img,
+                                 skia.Rect(0, 0, r['w'], r['h']),
+                                 skia.Rect(x, y, x+w, y+h), paint)
             if r['id'] in selected:
                 canvas.drawRect(
-                    skia.Rect(r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h']), paint)
+                    skia.Rect(x, y, x+w, y+h), paint)
 
         canvas.save()
         canvas.resetMatrix()
