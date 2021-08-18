@@ -160,7 +160,7 @@ def _get_type(path):
         return 'video'
     elif path.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
         return 'image'
-    assert False
+    raise Exception('unknown extension for', path)
 
 
 def _get_or_insert_asset(source_path: str, f: BinaryIO):
@@ -198,13 +198,31 @@ def import_or_load_asset(resource_path: str):
         url = urlparse(resource_path)
         download_path = resource_path
         if url.netloc == 'twitter.com':
-            components = url.path.split('/')
+            components = url.path.removeprefix('/').split('/')
             if components[1] != 'status':
-                raise ValueError("Can't handle twitter path", url.path)
+                raise ValueError("Can't handle twitter path", url.path, components[1])
             tweet_id = components[2]
-            print(tsession.get_tweet(tweet_id)['extended_entities']['media'])
-            download_path = tsession.get_tweet(
-                tweet_id)['extended_entities']['media'][0]['media_url']
+            # TODO: add dropdown selection for this:
+            all_media = tsession.get_tweet(tweet_id)['extended_entities']['media']
+
+            print(all_media)
+            media = all_media[-1]
+            download_path = None
+
+            # try to fetch video first
+            if 'video_info' in media:
+                for v in media['video_info']['variants']:
+                    if v['content_type'] == 'video/mp4':
+                        # strip off parameters because twitter adds weird stuff
+                        u = urlparse(v['url'])
+                        download_path = u.scheme + '://' + u.netloc + u.path
+                        break
+
+            # fall back to thumbnail
+            if download_path is None:
+                download_path = media['media_url']
+
+            print('downloading ', download_path)
 
         # generic downloader
         r = requests.get(download_path, stream=True)
